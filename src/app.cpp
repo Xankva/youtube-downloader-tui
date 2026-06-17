@@ -150,7 +150,7 @@ private:
                 return true;
             }
             if (event.mouse().button == Mouse::Left &&
-                event.mouse().motion == Mouse::Released) {
+                event.mouse().motion == Mouse::Pressed) {
                 if (!CaptureMouse(event))
                     return false;
                 int mouse_x = event.mouse().x;
@@ -216,7 +216,7 @@ App::App(std::filesystem::path config_dir)
 
     queue_.set_change_callback([this] { on_download_change(); });
 
-    add_log(LogMessage::Info, "YouTube TUI Downloader started");
+    add_log(LogMessage::Info, "YouTube Downloader TUI started");
     add_log(LogMessage::Info, "Using yt-dlp: " + download_manager_.get_ytdlp_path());
 
     if (!std::filesystem::exists(download_manager_.get_ytdlp_path())) {
@@ -229,15 +229,15 @@ App::App(std::filesystem::path config_dir)
 }
 
 App::~App() {
+    // P1.4: Clear queue change callback so the queue thread doesn't invoke methods
+    // on partially-destroyed App while we shut down.
+    queue_.set_change_callback(nullptr);
     fetch_running_ = false;
-    // Wait for fetch thread to finish via polling (it checks fetch_running_ after sleep)
-    for (int i = 0; i < 20; i++) {
-        if (!fetch_running_) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    // If joinable, join it (shouldn't happen since we detached, but safety)
+    ++fetch_generation_;
     if (fetch_thread_.joinable())
         fetch_thread_.join();
+    queue_.shutdown();
+    download_manager_.cleanup_finished();
     save_config();
 }
 
@@ -255,21 +255,6 @@ void App::clear_log() {
 void App::save_config() {
     config_.output_dir = std::filesystem::absolute(std::filesystem::path(output_path_input_));
     config_manager_.save(config_);
-}
-
-void App::delete_last_word(std::string& s) {
-    if (s.empty()) return;
-    // Trim trailing spaces
-    auto end = s.find_last_not_of(' ');
-    if (end == std::string::npos) { s.clear(); return; }
-    if (end != s.size() - 1) s.erase(end + 1);
-    // Find start of last word
-    auto start = s.find_last_of(' ', end);
-    if (start == std::string::npos || start == 0) {
-        s.clear();
-    } else {
-        s.erase(start);
-    }
 }
 
 void App::enqueue_from_url() {
@@ -305,16 +290,17 @@ void App::enqueue_from_url() {
 
 void App::start_fetch_info(const std::string& url) {
     if (url.empty()) return;
+    int my_gen;
     {
         std::lock_guard<std::mutex> lock(fetch_mutex_);
         if (url == cached_url_) return;
         cached_url_ = url;
+        my_gen = ++fetch_generation_;
     }
 
-    // Detach previous fetch thread instead of joining (avoids blocking UI for debounce delay)
+    fetch_running_ = false;
     if (fetch_thread_.joinable()) {
-        fetch_running_ = false;
-        fetch_thread_.detach();
+        fetch_thread_.join();
     }
 
     fetch_in_progress_ = true;
@@ -324,18 +310,23 @@ void App::start_fetch_info(const std::string& url) {
         status_text_ = "Fetching formats...";
     }
 
-    fetch_thread_ = std::thread([this, url]() {
+    fetch_thread_ = std::thread([this, url, my_gen]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(600));
-        if (!fetch_running_) { fetch_in_progress_ = false; return; }
+        if (!fetch_running_ || fetch_generation_ != my_gen) {
+            fetch_in_progress_ = false; return;
+        }
 
         std::string current;
         { std::lock_guard<std::mutex> lock(fetch_mutex_); current = cached_url_; }
-        if (current != url) { fetch_in_progress_ = false; return; }
+        if (current != url || fetch_generation_ != my_gen) {
+            fetch_in_progress_ = false; return;
+        }
 
         try {
             auto vi = download_manager_.fetch_info(url);
             {
                 std::lock_guard<std::mutex> lock(fetch_mutex_);
+                if (fetch_generation_ != my_gen) { fetch_in_progress_ = false; return; }
                 current_video_info_ = vi;
                 fetch_in_progress_ = false;
             }
@@ -384,12 +375,7 @@ void App::on_url_change() {
 
 void App::update_queued_titles(const std::string& url, const std::string& title) {
     if (title.empty()) return;
-    auto items = queue_.all_items();
-    for (auto& item : items) {
-        if (item->url == url && item->title.empty()) {
-            item->title = title;
-        }
-    }
+    queue_.update_title(url, title);
 }
 
 void App::on_download_change() {
@@ -642,7 +628,7 @@ void App::setup_components() {
 
         if (show_help_) {
             return bg(vbox(
-                text(" YouTube TUI Downloader ") | bold | underlined | center,
+                text(" YouTube Downloader TUI ") | bold | underlined | center,
                 separator(),
                 text(" Enter URL, click Download or Add to Queue.") | flex,
                 text(" Toggle Audio Only for mp3 download."),
@@ -800,15 +786,21 @@ Element App::render_header() {
     Elements left;
     left.push_back(text(" ") | color(c_purple));
     left.push_back(text("\u2502") | color(c_purple));
-    left.push_back(text(" yt-tui ") | bold | color(c_purple_lt));
+    left.push_back(text(" ytd ") | bold | color(c_purple_lt));
     if (!subtitle.empty()) {
         left.push_back(text("\u2502") | color(c_border));
         left.push_back(text(" " + subtitle + " ") | color(c_dim_l));
     }
     if (fetching) {
         static const char* sp = "\u25d4\u25d1\u25d5\u25d2";
-        static int si = 0;
-        left.push_back(text(std::string(1, sp[(++si) % 4])) | color(c_yellow));
+        static auto last = std::chrono::steady_clock::now();
+        static int phase = 0;
+        auto now = std::chrono::steady_clock::now();
+        if (now - last > std::chrono::milliseconds(250)) {
+            phase = (phase + 1) % 4;
+            last = now;
+        }
+        left.push_back(text(std::string(1, sp[phase])) | color(c_yellow));
     }
 
     Elements right;
@@ -831,7 +823,7 @@ Element App::render_welcome() {
             vbox({
                 text("  YT-TUI  ") | color(c_purple_lt) | bold | underlined | center,
                 text("") | size(HEIGHT, EQUAL, 2),
-                text("  YouTube TUI Downloader  ") | color(c_purple_lt) | bold | center,
+                text("  YouTube Downloader TUI  ") | color(c_purple_lt) | bold | center,
                 text("  v" + std::string("1.0.0") + "  ") | color(c_dim) | center,
                 text("") | size(HEIGHT, EQUAL, 1),
                 text("  \u25b8 Paste a URL and press Download  \u25c2  ") | color(c_dim) | center,
@@ -1018,8 +1010,14 @@ Element App::render_queue_tab() {
         std::string sstr = status_icon + " " + state_to_string(item->state);
         if (item->state == DownloadState::Running) {
             static const char* sp = "\u25d4\u25d1\u25d5\u25d2";
-            static int si = 0;
-            sstr = status_icon + " " + std::string(1, sp[(++si) % 4]);
+            static auto last = std::chrono::steady_clock::now();
+            static int phase = 0;
+            auto now = std::chrono::steady_clock::now();
+            if (now - last > std::chrono::milliseconds(250)) {
+                phase = (phase + 1) % 4;
+                last = now;
+            }
+            sstr = status_icon + " " + std::string(1, sp[phase]);
         }
 
         rows.push_back(separator() | color(c_border));
@@ -1089,9 +1087,7 @@ Element App::render_history_tab() {
         text("  ")
     ) | bgcolor(c_bg_dark));
 
-    size_t cnt = 0;
     for (auto& h : e) {
-        if (cnt++ >= 20) break;
         auto t = h.title.empty() ? (h.url.empty() ? "(unknown)" : h.url.substr(0, 40)) : h.title.substr(0, 40);
         if (t.size() >= 40) t += "...";
         Color sc = (h.state == DownloadState::Completed) ? c_green : c_red;
@@ -1106,7 +1102,7 @@ Element App::render_history_tab() {
         ));
     }
     return vbox(Elements{
-        vbox(std::move(rows)) | flex,
+        vbox(std::move(rows)) | yframe | vscroll_indicator | flex,
         thin_sep(),
         hbox(text("   "), clear_history_btn_->Render()) | center,
     }) | flex;
@@ -1127,7 +1123,12 @@ Element App::render_log_tab() {
 
     for (auto& msg : copy) {
         auto t = std::chrono::system_clock::to_time_t(msg.time);
-        std::tm tm; localtime_r(&t, &tm);
+        std::tm tm;
+#ifdef _WIN32
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
         std::array<char, 32> buf;
         std::strftime(buf.data(), buf.size(), "%H:%M:%S", &tm);
         Color c; std::string p;
@@ -1145,7 +1146,7 @@ Element App::render_log_tab() {
         ));
     }
     return vbox(Elements{
-        vbox(std::move(lines)) | flex,
+        vbox(std::move(lines)) | yframe | vscroll_indicator | flex,
         thin_sep(),
         hbox(text("   "), clear_log_btn_->Render()) | center,
     }) | flex;

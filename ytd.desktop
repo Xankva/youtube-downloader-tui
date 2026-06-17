@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=YouTube Downloader TUI
+Comment=Terminal UI YouTube downloader using yt-dlp
+Exec=ytd
+Icon=ytd
+Terminal=true
+Categories=Utility;AudioVideo;
+Keywords=yt-dlp;youtube;download;video;audio;

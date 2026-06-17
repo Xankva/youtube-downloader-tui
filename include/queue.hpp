@@ -5,6 +5,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <optional>
 
 namespace yt_tui {
 
@@ -13,6 +14,7 @@ public:
     using ChangeCallback = std::function<void()>;
 
     DownloadQueue(DownloadManager& manager);
+    ~DownloadQueue();
 
     void set_change_callback(ChangeCallback cb);
 
@@ -31,6 +33,8 @@ public:
     int total_count() const;
 
     void process();
+    void shutdown();
+    void update_title(const std::string& url, const std::string& title);
 
 private:
     void notify_change();
@@ -43,6 +47,8 @@ private:
     int max_concurrent_{3};
     int next_id_{1};
     std::atomic<bool> processing_{false};
+    std::atomic<bool> stop_processing_{false};
+    std::optional<std::thread> processing_thread_;
 };
 
 } // namespace yt_tui

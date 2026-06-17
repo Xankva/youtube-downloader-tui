@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <cstdio>
+#include <cstdint>
 
 namespace yt_tui {
 
@@ -78,7 +79,7 @@ struct DownloadItem {
     MediaType media_type{MediaType::Video};
     std::string format;
     std::string resolution;
-    DownloadState state{DownloadState::Pending};
+    std::atomic<DownloadState> state{DownloadState::Pending};
     DownloadProgress progress;
     int retries{0};
     int max_retries{3};
@@ -109,6 +110,7 @@ public:
     void cancel_download(int id);
     void pause_download(int id);
     void resume_download(int id);
+    void cleanup_finished();
 
     bool is_running(int id) const;
     static std::string build_ytdlp_command(
@@ -127,7 +129,8 @@ private:
         std::unique_ptr<std::thread> thread;
         std::atomic<bool> cancelled{false};
         std::atomic<bool> paused{false};
-        std::atomic<pid_t> child_pid{0};
+        std::atomic<bool> finished{false};
+        std::atomic<uintptr_t> child_handle_{0};
     };
 
     mutable std::mutex active_mutex_;

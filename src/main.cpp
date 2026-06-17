@@ -2,18 +2,13 @@
 #include <cstdlib>
 #include <iostream>
 #include <filesystem>
-#include <signal.h>
 
 namespace {
 
-void handle_signal(int) {
-    // Signal handler placeholder - FTXUI handles graceful shutdown internally
-}
-
 void print_usage() {
-    std::cout << "YouTube TUI Downloader v1.0.0" << std::endl;
+    std::cout << "YouTube Downloader TUI v1.0.0" << std::endl;
     std::cout << std::endl;
-    std::cout << "Usage: yt-tui [OPTIONS]" << std::endl;
+    std::cout << "Usage: ytd [OPTIONS]" << std::endl;
     std::cout << std::endl;
     std::cout << "Options:" << std::endl;
     std::cout << "  --help, -h     Show this help message" << std::endl;
@@ -33,22 +28,35 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         if (arg == "--version" || arg == "-v") {
-            std::cout << "yt-tui v1.0.0" << std::endl;
+            std::cout << "ytd v1.0.0" << std::endl;
             return 0;
         }
     }
 
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
-
+#ifdef _WIN32
+    const char* home_env = std::getenv("USERPROFILE");
+    const char* home_drive = std::getenv("HOMEDRIVE");
+    const char* home_path = std::getenv("HOMEPATH");
+    std::string home_str;
+    if (home_env) {
+        home_str = home_env;
+    } else if (home_drive && home_path) {
+        home_str = std::string(home_drive) + home_path;
+    }
+    if (home_str.empty()) {
+        std::cerr << "Cannot determine home directory" << std::endl;
+        return 1;
+    }
+    std::filesystem::path home_dir(home_str);
+#else
     auto home = std::getenv("HOME");
     if (!home) {
         std::cerr << "HOME environment variable not set" << std::endl;
         return 1;
     }
-
     std::filesystem::path home_dir(home);
-    auto config_dir = home_dir / ".config" / "yt-tui";
+#endif
+    auto config_dir = home_dir / ".config" / "ytd";
     std::filesystem::create_directories(config_dir);
     std::filesystem::create_directories(config_dir / "downloads");
 

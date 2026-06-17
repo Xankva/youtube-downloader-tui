@@ -1,0 +1,23 @@
+# Build outputs
+build/
+ytd
+ytd-nostack
+ytd.exe
+ytd-nostack.exe
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# AUR packaging (separate repo on aur.archlinux.org)
+aur/
+
+# User config / runtime
+downloads/

@@ -6,6 +6,10 @@ namespace yt_tui {
 DownloadQueue::DownloadQueue(DownloadManager& manager)
     : manager_(manager) {}
 
+DownloadQueue::~DownloadQueue() {
+    shutdown();
+}
+
 void DownloadQueue::set_change_callback(ChangeCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     change_callback_ = std::move(cb);
@@ -110,11 +114,19 @@ int DownloadQueue::total_count() const {
     return static_cast<int>(items_.size());
 }
 
+void DownloadQueue::shutdown() {
+    stop_processing_ = true;
+    if (processing_thread_ && processing_thread_->joinable())
+        processing_thread_->join();
+    processing_thread_.reset();
+    processing_ = false;
+}
+
 void DownloadQueue::process() {
     if (processing_.exchange(true)) return;
 
-    std::thread([this]() {
-        while (true) {
+    processing_thread_.emplace([this]() {
+        while (!stop_processing_) {
             std::shared_ptr<DownloadItem> item;
 
             {
@@ -124,9 +136,10 @@ void DownloadQueue::process() {
                     if (i->state == DownloadState::Running) active++;
                 }
 
-                while (active >= max_concurrent_ && !pending_ids_.empty()) {
+                while (active >= max_concurrent_ && !pending_ids_.empty() && !stop_processing_) {
                     lock.unlock();
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (stop_processing_) { lock.lock(); break; }
                     lock.lock();
                     active = 0;
                     for (auto& i : items_) {
@@ -158,7 +171,8 @@ void DownloadQueue::process() {
                         }
                     }
                 }
-                if (all_done) {
+                manager_.cleanup_finished();
+                if (all_done || stop_processing_) {
                     processing_ = false;
                     return;
                 }
@@ -170,19 +184,29 @@ void DownloadQueue::process() {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (item->state != DownloadState::Pending)
                     continue;
+                // start_download creates a thread and returns quickly. If cancel()
+                // was called concurrently it will block on mutex_ until we release
+                // it, then set cancelled=true and kill the child process. The
+                // download thread detects cancelled via ActiveDownload::cancelled.
                 manager_.start_download(
                     item,
                     [this](const DownloadProgress&) { notify_change(); },
                     [this](const DownloadItem&) { notify_change(); }
                 );
-                // Handle race: item may have been cancelled between the state check
-                // and start_download. If so, cancel it in the manager immediately.
-                if (item->state == DownloadState::Cancelled) {
-                    manager_.cancel_download(item->id);
-                }
+                manager_.cleanup_finished();
             }
         }
-    }).detach();
+        processing_ = false;
+    });
+}
+
+void DownloadQueue::update_title(const std::string& url, const std::string& title) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& item : items_) {
+        if (item->url == url && item->title.empty()) {
+            item->title = title;
+        }
+    }
 }
 
 void DownloadQueue::notify_change() {

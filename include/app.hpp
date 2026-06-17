@@ -56,7 +56,6 @@ private:
     void open_file_browser();
     void navigate_browser(const std::filesystem::path& path);
     void select_browser_entry(const std::string& entry);
-    static void delete_last_word(std::string& s);
 
     ftxui::ScreenInteractive screen_;
     ConfigManager config_manager_;
@@ -95,6 +94,7 @@ private:
     std::mutex fetch_mutex_;
     std::thread fetch_thread_;
     std::atomic<bool> fetch_running_{false};
+    std::atomic<int> fetch_generation_{0};
 
     // File browser state
     bool show_file_browser_{false};

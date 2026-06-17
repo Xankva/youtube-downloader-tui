@@ -9,7 +9,11 @@ namespace yt_tui {
 static std::string time_point_to_string(const std::chrono::system_clock::time_point& tp) {
     auto t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm;
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
     localtime_r(&t, &tm);
+#endif
     std::array<char, 64> buf;
     std::strftime(buf.data(), buf.size(), "%Y-%m-%d %H:%M:%S", &tm);
     return buf.data();

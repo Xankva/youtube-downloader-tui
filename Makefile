@@ -13,7 +13,7 @@ BUILD_DIRS := $(sort $(dir $(FTXUI_OBJ) $(APP_OBJ)))
 
 .PHONY: all clean run
 
-all: yt-tui
+all: ytd
 
 $(BUILD_DIRS):
 	mkdir -p $@
@@ -27,18 +27,18 @@ build/src/%.o: src/%.cpp include/%.hpp | $(BUILD_DIRS)
 build/src/%.o: src/%.cpp | $(BUILD_DIRS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-yt-tui: $(FTXUI_OBJ) $(APP_OBJ)
+ytd: $(FTXUI_OBJ) $(APP_OBJ)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-run: yt-tui
-	./yt-tui
+run: ytd
+	./ytd
 
 check-deps:
 	@test -f bin/yt-dlp || { echo "ERROR: bin/yt-dlp not found"; exit 1; }
-	@test -f deps/json.hpp || { echo "ERROR: deps/json.hpp not found"; exit 1; }
+	@test -f deps/nlohmann/json.hpp || { echo "ERROR: deps/nlohmann/json.hpp not found"; exit 1; }
 	@test -f deps/ftxui/include/ftxui/component/component.hpp || { echo "ERROR: ftxui headers not found"; exit 1; }
 
 clean:
-	rm -rf build yt-tui
+	rm -rf build ytd
 
 -include $(FTXUI_OBJ:.o=.d) $(APP_OBJ:.o=.d)

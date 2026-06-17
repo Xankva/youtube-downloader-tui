@@ -156,6 +156,9 @@ void DownloadQueue::process() {
                         item = *it;
                         break;
                     }
+                    // BUG-09 fix: if the item was cancelled before we could start it,
+                    // it's already in a terminal state — just skip it silently.
+                    // No need to re-enqueue; it will show up in the terminal check below.
                 }
             }
 

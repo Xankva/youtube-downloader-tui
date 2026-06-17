@@ -39,16 +39,12 @@ nlohmann::json Config::to_json() const {
     };
 }
 
-static int clamp(int val, int lo, int hi) {
-    return std::max(lo, std::min(hi, val));
-}
-
 Config Config::from_json(const nlohmann::json& j) {
     Config c;
     if (j.contains("output_dir")) c.output_dir = j["output_dir"].get<std::string>();
     if (j.contains("output_template")) c.output_template = j["output_template"].get<std::string>();
-    if (j.contains("max_concurrent")) c.max_concurrent = clamp(j["max_concurrent"].get<int>(), 1, 16);
-    if (j.contains("max_retries")) c.max_retries = clamp(j["max_retries"].get<int>(), 0, 20);
+    if (j.contains("max_concurrent")) c.max_concurrent = std::clamp(j["max_concurrent"].get<int>(), 1, 16);
+    if (j.contains("max_retries")) c.max_retries = std::clamp(j["max_retries"].get<int>(), 0, 20);
     if (j.contains("prefer_mp4")) c.prefer_mp4 = j["prefer_mp4"].get<bool>();
     if (j.contains("default_audio_format")) {
         auto fmt = j["default_audio_format"].get<std::string>();

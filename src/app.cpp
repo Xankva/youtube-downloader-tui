@@ -153,17 +153,18 @@ private:
                 event.mouse().motion == Mouse::Pressed) {
                 if (!CaptureMouse(event))
                     return false;
+                // BUG-15 fix: boxes_[i] stores the reflect box for entry index i.
+                // Render() uses full indices starting from scroll_offset_, so we
+                // iterate only the visible range and use i directly as entry_idx.
+                int end_idx = std::min((int)entries_.size(), scroll_offset_ + BROWSER_VISIBLE);
                 int mouse_x = event.mouse().x;
                 int mouse_y = event.mouse().y;
-                for (int i = 0; i < (int)boxes_.size(); i++) {
+                for (int i = scroll_offset_; i < end_idx; i++) {
                     if (boxes_[i].Contain(mouse_x, mouse_y)) {
-                        int entry_idx = scroll_offset_ + i;
-                        if (entry_idx < (int)entries_.size()) {
-                            selected_ = entry_idx;
-                            if (on_click_)
-                                on_click_(entry_idx);
-                            return true;
-                        }
+                        selected_ = i;
+                        if (on_click_)
+                            on_click_(i);
+                        return true;
                     }
                 }
             }
@@ -457,6 +458,8 @@ void App::select_browser_entry(const std::string& entry) {
         output_path_input_ = browser_current_path_;
         show_file_browser_ = false;
         save_config();
+        // BUG-06 fix: protect status_text_ writes with state_mutex_.
+        std::lock_guard<std::mutex> lock(state_mutex_);
         status_text_ = "Path: " + browser_current_path_;
         return;
     }
@@ -506,11 +509,13 @@ void App::setup_components() {
     });
     queue_btn_ = Button(" \u002b Queue ", [this] {
         enqueue_from_url();
+        // BUG-16 fix: start the processing thread so queued items actually run.
+        queue_.process();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             auto items = queue_.all_items();
             if (!items.empty()) {
-                status_text_ = "Queued (ID: " + std::to_string(items.back()->id) + ") \u25b6 Download to start";
+                status_text_ = "Queued (ID: " + std::to_string(items.back()->id) + ") ▶ Downloading";
             }
         }
     });
@@ -624,7 +629,11 @@ void App::setup_components() {
 
         tab_q_label_ = " Queue (" + std::to_string(queue_.total_count()) + ") ";
         tab_h_label_ = " History (" + std::to_string(history_.get_all().size()) + ") ";
-        tab_l_label_ = " Log (" + std::to_string(log_messages_.size()) + ") ";
+        // BUG-10 fix: read log_messages_.size() under the log_mutex_ lock.
+        {
+            std::lock_guard<std::mutex> lock(log_mutex_);
+            tab_l_label_ = " Log (" + std::to_string(log_messages_.size()) + ") ";
+        }
 
         if (show_help_) {
             return bg(vbox(
@@ -793,14 +802,14 @@ Element App::render_header() {
     }
     if (fetching) {
         static const char* sp = "\u25d4\u25d1\u25d5\u25d2";
-        static auto last = std::chrono::steady_clock::now();
-        static int phase = 0;
         auto now = std::chrono::steady_clock::now();
-        if (now - last > std::chrono::milliseconds(250)) {
-            phase = (phase + 1) % 4;
-            last = now;
+        // BUG-02 fix: use member variables instead of static locals so the
+        // spinner state is not shared with per-item spinners in the queue tab.
+        if (now - spinner_last_ > std::chrono::milliseconds(250)) {
+            spinner_phase_ = (spinner_phase_ + 1) % 4;
+            spinner_last_ = now;
         }
-        left.push_back(text(std::string(1, sp[phase])) | color(c_yellow));
+        left.push_back(text(std::string(1, sp[spinner_phase_])) | color(c_yellow));
     }
 
     Elements right;
@@ -1009,15 +1018,15 @@ Element App::render_queue_tab() {
 
         std::string sstr = status_icon + " " + state_to_string(item->state);
         if (item->state == DownloadState::Running) {
+            // BUG-02 fix: use member spinner state rather than static locals
+            // inside this per-item loop (statics would be shared across iterations).
             static const char* sp = "\u25d4\u25d1\u25d5\u25d2";
-            static auto last = std::chrono::steady_clock::now();
-            static int phase = 0;
             auto now = std::chrono::steady_clock::now();
-            if (now - last > std::chrono::milliseconds(250)) {
-                phase = (phase + 1) % 4;
-                last = now;
+            if (now - spinner_last_ > std::chrono::milliseconds(250)) {
+                spinner_phase_ = (spinner_phase_ + 1) % 4;
+                spinner_last_ = now;
             }
-            sstr = status_icon + " " + std::string(1, sp[phase]);
+            sstr = status_icon + " " + std::string(1, sp[spinner_phase_]);
         }
 
         rows.push_back(separator() | color(c_border));
@@ -1090,7 +1099,9 @@ Element App::render_history_tab() {
     for (auto& h : e) {
         auto t = h.title.empty() ? (h.url.empty() ? "(unknown)" : h.url.substr(0, 40)) : h.title.substr(0, 40);
         if (t.size() >= 40) t += "...";
-        Color sc = (h.state == DownloadState::Completed) ? c_green : c_red;
+        Color sc = (h.state == DownloadState::Completed) ? c_green
+                 : (h.state == DownloadState::Cancelled)  ? c_yellow
+                 : c_red;  // BUG-12 fix: cancelled → yellow, failed → red
         rows.push_back(separator() | color(c_border));
         rows.push_back(hbox(
             text("  "),
@@ -1109,7 +1120,10 @@ Element App::render_history_tab() {
 }
 
 Element App::render_log_tab() {
-    if (log_messages_.empty())
+    // BUG-10 fix: read log_messages_ under the log_mutex_ lock.
+    std::vector<LogMessage> copy;
+    { std::lock_guard<std::mutex> lock(log_mutex_); copy = log_messages_; }
+    if (copy.empty())
         return vbox(Elements{
             text("") | size(HEIGHT, EQUAL, 2),
             hbox(text("   "), dim_text("\u2205 no logs")) | center | flex,
@@ -1118,8 +1132,7 @@ Element App::render_log_tab() {
         }) | flex;
 
     Elements lines;
-    std::vector<LogMessage> copy;
-    { std::lock_guard<std::mutex> lock(log_mutex_); copy = log_messages_; }
+    // (copy already captured under lock above)
 
     for (auto& msg : copy) {
         auto t = std::chrono::system_clock::to_time_t(msg.time);
@@ -1183,7 +1196,8 @@ Element App::render_status_bar() {
         text(" "),
         text(s) | color(fg),
         text(" ") | flex,
-        dim_text("\u2318C quit")
+        // BUG-19 fix: use Ctrl+C instead of macOS ⌘ symbol on all platforms.
+        dim_text("Ctrl+C quit")
     ) | bgcolor(c_bg_dark);
 }
 

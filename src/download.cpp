@@ -97,8 +97,12 @@ static std::string exec_and_capture(const std::string& cmd) {
 #else
     int rc = pclose(pipe);
 #endif
-    if (rc != 0 && result.empty()) {
-        throw std::runtime_error("yt-dlp command failed");
+    // BUG-14 fix: throw on non-zero exit regardless of whether there is output,
+    // unless output already contains JSON (caller will detect and throw anyway).
+    if (rc != 0 && result.find('{') == std::string::npos) {
+        std::string err = result.empty() ? "yt-dlp command failed" :
+            "yt-dlp error: " + result.substr(0, 200);
+        throw std::runtime_error(err);
     }
     return result;
 }
@@ -242,13 +246,18 @@ DownloadManager::~DownloadManager() {
             }
         }
     }
+    // BUG-03 fix: poll without holding the lock so download threads can set
+    // finished=true without being starved by the destructor spinning.
     for (int i = 0; i < 100; i++) {
-        std::lock_guard<std::mutex> lock(active_mutex_);
         bool all_finished = true;
-        for (auto& [id, ad] : active_downloads_) {
-            if (ad && !ad->finished) { all_finished = false; break; }
+        {
+            std::lock_guard<std::mutex> lock(active_mutex_);
+            for (auto& [id, ad] : active_downloads_) {
+                if (ad && !ad->finished) { all_finished = false; break; }
+            }
         }
         if (all_finished) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     std::vector<std::unique_ptr<std::thread>> threads_to_join;
     {
@@ -454,20 +463,23 @@ std::string DownloadManager::build_ytdlp_command(
     cmd += " --extractor-retries 3";
 
     std::filesystem::create_directories(output_dir);
-    cmd += " -o \"" + (output_dir / output_template).string() + "\"";
+    // BUG-07 fix: use shell_quote() for paths and format strings to handle
+    // spaces, special characters and potential shell metacharacters safely.
+    cmd += " -o " + shell_quote((output_dir / output_template).string());
 
     if (item.media_type == MediaType::Audio) {
         cmd += " -x";
-        cmd += " --audio-format " + item.format;
+        cmd += " --audio-format " + shell_quote(item.format);
         cmd += " --audio-quality 0";
     } else {
         if (!item.resolution.empty() && item.resolution != "best") {
-            cmd += " -f \"bestvideo[height<=" + item.resolution + "]+bestaudio/best[height<=" + item.resolution + "]\"";
+            std::string fmt = "bestvideo[height<=" + item.resolution + "]+bestaudio/best[height<=" + item.resolution + "]";
+            cmd += " -f " + shell_quote(fmt);
         } else {
-            cmd += " -f \"bestvideo+bestaudio/best\"";
+            cmd += " -f " + shell_quote("bestvideo+bestaudio/best");
         }
         if (!item.format.empty() && item.format != "mp4") {
-            cmd += " --merge-output-format " + item.format;
+            cmd += " --merge-output-format " + shell_quote(item.format);
         } else {
             cmd += " --merge-output-format mp4";
         }
@@ -496,12 +508,9 @@ void DownloadManager::start_download(std::shared_ptr<DownloadItem> item,
     auto ad = std::make_unique<ActiveDownload>();
     ad->item = item;
 
-    {
-        std::lock_guard<std::mutex> lock(active_mutex_);
-        active_downloads_[id] = std::move(ad);
-    }
-
-    active_downloads_[id]->thread = std::make_unique<std::thread>([this, id, item, on_progress, on_state]() {
+    // BUG-01 fix: create the thread *before* moving ad into the map so we
+    // hold a valid pointer through the entire setup. Then insert under the lock.
+    ad->thread = std::make_unique<std::thread>([this, id, item, on_progress, on_state]() {
         auto cleanup = [this, id]() {
             std::lock_guard<std::mutex> lock(active_mutex_);
             auto it = active_downloads_.find(id);
@@ -638,6 +647,11 @@ void DownloadManager::start_download(std::shared_ptr<DownloadItem> item,
         if (on_state) on_state(*item);
         cleanup();
     });
+
+    {
+        std::lock_guard<std::mutex> lock(active_mutex_);
+        active_downloads_[id] = std::move(ad);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,8 +682,11 @@ void DownloadManager::cancel_download(int id) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             retries++;
         }
-        if (retries >= 10)
+        if (retries >= 10) {
             kill(-pid, SIGKILL);
+            // BUG-08 fix: reap the process after SIGKILL to prevent zombie accumulation.
+            waitpid(pid, nullptr, 0);
+        }
 #endif
     }
 }

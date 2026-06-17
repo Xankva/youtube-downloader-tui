@@ -14,6 +14,7 @@
 #include <memory>
 #include <unordered_set>
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <algorithm>
 
@@ -95,6 +96,10 @@ private:
     std::thread fetch_thread_;
     std::atomic<bool> fetch_running_{false};
     std::atomic<int> fetch_generation_{0};
+
+    // Spinner state (shared across header + queue rows to avoid static locals in loops)
+    int spinner_phase_{0};
+    std::chrono::steady_clock::time_point spinner_last_{std::chrono::steady_clock::now()};
 
     // File browser state
     bool show_file_browser_{false};

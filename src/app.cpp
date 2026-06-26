@@ -217,6 +217,59 @@ App::App(std::filesystem::path config_dir)
 
     queue_.set_change_callback([this] { on_download_change(); });
 
+    fetch_running_ = true;
+    fetch_thread_ = std::thread([this]() {
+        while (fetch_running_) {
+            std::string url;
+            int gen;
+            {
+                std::unique_lock<std::mutex> lock(fetch_start_mutex_);
+                fetch_cv_.wait_for(lock, std::chrono::milliseconds(600), [this] {
+                    return !fetch_running_ || !fetch_pending_url_.empty();
+                });
+                if (!fetch_running_) break;
+                if (fetch_pending_url_.empty()) continue;
+                url = fetch_pending_url_;
+                fetch_pending_url_.clear();
+                {
+                    std::lock_guard<std::mutex> lk(fetch_mutex_);
+                    gen = fetch_generation_;
+                }
+            }
+
+            fetch_in_progress_ = true;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                status_text_ = "Fetching formats...";
+            }
+
+            try {
+                auto vi = download_manager_.fetch_info(url);
+                {
+                    std::lock_guard<std::mutex> lock(fetch_mutex_);
+                    if (fetch_generation_ != gen) { fetch_in_progress_ = false; continue; }
+                    current_video_info_ = vi;
+                    fetch_in_progress_ = false;
+                }
+                update_queued_titles(url, vi.title);
+                add_log(LogMessage::Success, vi.title + " (" + vi.duration + ")");
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    status_text_ = vi.title;
+                }
+            } catch (const std::exception& e) {
+                fetch_in_progress_ = false;
+                add_log(LogMessage::Warning, "Fetch failed: " + std::string(e.what()));
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex_);
+                    status_text_ = "Info fetch failed";
+                }
+            }
+            screen_.PostEvent(Event::Custom);
+        }
+        fetch_in_progress_ = false;
+    });
+
     add_log(LogMessage::Info, "YouTube Downloader TUI started");
     add_log(LogMessage::Info, "Using yt-dlp: " + download_manager_.get_ytdlp_path());
 
@@ -234,7 +287,7 @@ App::~App() {
     // on partially-destroyed App while we shut down.
     queue_.set_change_callback(nullptr);
     fetch_running_ = false;
-    ++fetch_generation_;
+    fetch_cv_.notify_one();
     if (fetch_thread_.joinable())
         fetch_thread_.join();
     queue_.shutdown();
@@ -258,11 +311,17 @@ void App::save_config() {
     config_manager_.save(config_);
 }
 
-void App::enqueue_from_url() {
+bool App::enqueue_from_url() {
     if (url_input_.empty()) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         status_text_ = "Enter a URL";
-        return;
+        return false;
+    }
+
+    if (queue_.has_url(url_input_)) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        status_text_ = "Already in queue";
+        return false;
     }
 
     auto item = std::make_shared<DownloadItem>();
@@ -287,88 +346,29 @@ void App::enqueue_from_url() {
         std::lock_guard<std::mutex> lock(state_mutex_);
         status_text_ = "Queued (ID: " + std::to_string(id) + ")";
     }
+    return true;
 }
 
 void App::start_fetch_info(const std::string& url) {
     if (url.empty()) return;
-    int my_gen;
+    std::lock_guard<std::mutex> lock(fetch_mutex_);
+    if (url == cached_url_) return;
+    cached_url_ = url;
+    ++fetch_generation_;
     {
-        std::lock_guard<std::mutex> lock(fetch_mutex_);
-        if (url == cached_url_) return;
-        cached_url_ = url;
-        my_gen = ++fetch_generation_;
+        std::lock_guard<std::mutex> lk(fetch_start_mutex_);
+        fetch_pending_url_ = url;
     }
-
-    fetch_running_ = false;
-    if (fetch_thread_.joinable()) {
-        fetch_thread_.join();
-    }
-
-    fetch_in_progress_ = true;
-    fetch_running_ = true;
-    {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        status_text_ = "Fetching formats...";
-    }
-
-    fetch_thread_ = std::thread([this, url, my_gen]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(600));
-        if (!fetch_running_ || fetch_generation_ != my_gen) {
-            fetch_in_progress_ = false; return;
-        }
-
-        std::string current;
-        { std::lock_guard<std::mutex> lock(fetch_mutex_); current = cached_url_; }
-        if (current != url || fetch_generation_ != my_gen) {
-            fetch_in_progress_ = false; return;
-        }
-
-        try {
-            auto vi = download_manager_.fetch_info(url);
-            {
-                std::lock_guard<std::mutex> lock(fetch_mutex_);
-                if (fetch_generation_ != my_gen) { fetch_in_progress_ = false; return; }
-                current_video_info_ = vi;
-                fetch_in_progress_ = false;
-            }
-            // Update any queued items with matching URL
-            update_queued_titles(url, vi.title);
-            add_log(LogMessage::Success, vi.title + " (" + vi.duration + ")");
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                status_text_ = vi.title;
-            }
-        } catch (const std::exception& e) {
-            fetch_in_progress_ = false;
-            add_log(LogMessage::Warning, "Fetch failed: " + std::string(e.what()));
-            {
-                std::lock_guard<std::mutex> lock(state_mutex_);
-                status_text_ = "Info fetch failed";
-            }
-        }
-        fetch_running_ = false;
-        screen_.PostEvent(Event::Custom);
-    });
+    fetch_cv_.notify_one();
 }
 
 void App::on_url_change() {
     std::string input = url_input_;
     if (input.empty()) return;
-    // Require at least "x://y" or known YouTube domain pattern to trigger fetch
-    bool looks_like_url = (input.find("://") != std::string::npos) ||
-                          (input.find("youtube.com") != std::string::npos) ||
-                          (input.find("youtu.be") != std::string::npos);
-    // Also match common short domains like "example.com/watch?v=..."
-    if (!looks_like_url && input.size() >= 8) {
-        size_t dot = input.find('.');
-        if (dot != std::string::npos && dot > 0 && dot < input.size() - 1) {
-            size_t slash = input.find('/', dot);
-            size_t space = input.find(' ');
-            if (slash != std::string::npos && space == std::string::npos)
-                looks_like_url = true;
-        }
-    }
-    if (looks_like_url) {
+    if (input.find("://") != std::string::npos ||
+        input.find("youtube.com") != std::string::npos ||
+        input.find("youtu.be") != std::string::npos)
+    {
         show_welcome_ = false;
         start_fetch_info(input);
     }
@@ -497,25 +497,15 @@ void App::setup_components() {
     url_input_comp_ = Input(&url_input_, "paste YouTube URL here...", input_style);
 
     download_btn_ = Button(" \u25b6 Download ", [this] {
-        enqueue_from_url();
+        bool enqueued = enqueue_from_url();
         queue_.process();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             auto items = queue_.all_items();
-            if (!items.empty() && items.back()->state == DownloadState::Pending) {
+            if (enqueued && !items.empty() && items.back()->state == DownloadState::Pending) {
                 status_text_ = "Download started (ID: " + std::to_string(items.back()->id) + ")";
-            }
-        }
-    });
-    queue_btn_ = Button(" \u002b Queue ", [this] {
-        enqueue_from_url();
-        // BUG-16 fix: start the processing thread so queued items actually run.
-        queue_.process();
-        {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            auto items = queue_.all_items();
-            if (!items.empty()) {
-                status_text_ = "Queued (ID: " + std::to_string(items.back()->id) + ") ▶ Downloading";
+            } else if (enqueued) {
+                status_text_ = "Queued (ID: " + std::to_string(items.back()->id) + ")";
             }
         }
     });
@@ -586,7 +576,7 @@ void App::setup_components() {
 
     auto main_content = Container::Vertical(Components{
         url_input_comp_,
-        Container::Horizontal(Components{download_btn_, queue_btn_, audio_toggle_btn_, quit_btn_}),
+        Container::Horizontal(Components{download_btn_, audio_toggle_btn_, quit_btn_}),
         path_display_comp_,
         Container::Horizontal(Components{browse_btn_}),
         tab_buttons_,
@@ -885,14 +875,12 @@ Element App::render_action_buttons() {
     Element space = text(" ") | size(WIDTH, EQUAL, 1);
 
     auto dl_el = download_btn_->Render();
-    auto q_el = queue_btn_->Render();
     auto au_el = audio_toggle_btn_->Render();
     auto qt_el = quit_btn_->Render();
 
     return hbox(
         text("   "),
         dl_el | color(audio_only_ ? c_green : c_purple) | bold, space,
-        q_el | color(c_blue), space,
         au_el | (audio_only_ ? (color(c_green) | bold) : color(c_dim)), space,
         text(" ") | flex,
         qt_el | color(c_red) | bold
@@ -953,13 +941,6 @@ Element App::render_queue_tab() {
     queue_cancel_ids_.clear();
     queue_clear_boxes_.clear();
     queue_clear_ids_.clear();
-    // Pre-allocate Box objects as members so reflect() references remain valid
-    // across the render cycle (local variables would be destroyed before FTXUI
-    // resolves the reflect references)
-    queue_cancel_boxes_.resize(items.size());
-    queue_clear_boxes_.resize(items.size());
-    size_t box_idx = 0;
-
     Elements rows;
 
     rows.push_back(hbox(
@@ -1037,14 +1018,14 @@ Element App::render_queue_tab() {
 
         Element action_el;
         if (is_terminal) {
-            Box& clear_box = queue_clear_boxes_[box_idx];
+            auto& clear_box = queue_clear_boxes_.emplace_back();
             action_el = hbox(
                 text("\u2716") | color(c_dim) | bold | bgcolor(c_bg_dark),
                 text(" ") | bgcolor(c_bg_dark) | size(WIDTH, EQUAL, 1)
             ) | reflect(clear_box);
             queue_clear_ids_.push_back(item->id);
         } else {
-            Box& cancel_box = queue_cancel_boxes_[box_idx];
+            auto& cancel_box = queue_cancel_boxes_.emplace_back();
             action_el = hbox(
                 text(" ") | bgcolor(Color::RGB(60, 30, 30)) | size(WIDTH, EQUAL, 1),
                 text("\u2715") | color(c_red) | bold | bgcolor(Color::RGB(60, 30, 30)),
@@ -1066,7 +1047,6 @@ Element App::render_queue_tab() {
             action_el,
             text("  ")
         ));
-        box_idx++;
     }
 
     return vbox(Elements{

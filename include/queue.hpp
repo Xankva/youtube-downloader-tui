@@ -3,9 +3,7 @@
 #include "download.hpp"
 #include <queue>
 #include <mutex>
-#include <condition_variable>
 #include <functional>
-#include <optional>
 
 namespace yt_tui {
 
@@ -18,6 +16,7 @@ public:
 
     void set_change_callback(ChangeCallback cb);
 
+    bool has_url(const std::string& url) const;
     int enqueue(std::shared_ptr<DownloadItem> item);
     bool cancel(int id);
     void cancel_all();
@@ -46,9 +45,7 @@ private:
     ChangeCallback change_callback_;
     int max_concurrent_{3};
     int next_id_{1};
-    std::atomic<bool> processing_{false};
-    std::atomic<bool> stop_processing_{false};
-    std::optional<std::thread> processing_thread_;
+    bool stop_processing_{false};
 };
 
 } // namespace yt_tui

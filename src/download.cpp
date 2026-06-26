@@ -502,7 +502,8 @@ std::string DownloadManager::build_ytdlp_command(
 
 void DownloadManager::start_download(std::shared_ptr<DownloadItem> item,
                                      ProgressCallback on_progress,
-                                     StateCallback on_state)
+                                     StateCallback on_state,
+                                     RetryCallback on_retry)
 {
     int id = item->id;
     auto ad = std::make_unique<ActiveDownload>();
@@ -510,7 +511,7 @@ void DownloadManager::start_download(std::shared_ptr<DownloadItem> item,
 
     // BUG-01 fix: create the thread *before* moving ad into the map so we
     // hold a valid pointer through the entire setup. Then insert under the lock.
-    ad->thread = std::make_unique<std::thread>([this, id, item, on_progress, on_state]() {
+    ad->thread = std::make_unique<std::thread>([this, id, item, on_progress, on_state, on_retry]() {
         auto cleanup = [this, id]() {
             std::lock_guard<std::mutex> lock(active_mutex_);
             auto it = active_downloads_.find(id);
@@ -609,6 +610,7 @@ void DownloadManager::start_download(std::shared_ptr<DownloadItem> item,
                     item->retries++;
                     item->state = DownloadState::Pending;
                     item->error_message = "Failed (will retry)";
+                    if (on_retry) on_retry(item->id);
                 } else {
                     item->state = DownloadState::Failed;
                     if (item->error_message.empty()) {
@@ -633,6 +635,7 @@ void DownloadManager::start_download(std::shared_ptr<DownloadItem> item,
                     item->retries++;
                     item->state = DownloadState::Pending;
                     item->error_message = "Failed (will retry)";
+                    if (on_retry) on_retry(item->id);
                 } else {
                     item->state = DownloadState::Failed;
                     if (item->error_message.empty()) {

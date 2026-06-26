@@ -49,7 +49,7 @@ private:
     void add_log(LogMessage::Level level, const std::string& text);
     void clear_log();
     void save_config();
-    void enqueue_from_url();
+    bool enqueue_from_url();
     void start_fetch_info(const std::string& url);
     void on_url_change();
     void on_download_change();
@@ -96,6 +96,9 @@ private:
     std::thread fetch_thread_;
     std::atomic<bool> fetch_running_{false};
     std::atomic<int> fetch_generation_{0};
+    std::mutex fetch_start_mutex_;
+    std::condition_variable fetch_cv_;
+    std::string fetch_pending_url_;
 
     // Spinner state (shared across header + queue rows to avoid static locals in loops)
     int spinner_phase_{0};
@@ -119,7 +122,7 @@ private:
     // Components
     ftxui::Component url_input_comp_;
     ftxui::Component download_btn_;
-    ftxui::Component queue_btn_;
+
     ftxui::Component audio_toggle_btn_;
     ftxui::Component quit_btn_;
     ftxui::Component path_input_comp_;

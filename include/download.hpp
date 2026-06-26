@@ -91,6 +91,7 @@ struct DownloadItem {
 
 using ProgressCallback = std::function<void(const DownloadProgress&)>;
 using StateCallback = std::function<void(const DownloadItem&)>;
+using RetryCallback = std::function<void(int id)>;
 
 class DownloadManager {
 public:
@@ -106,7 +107,8 @@ public:
     VideoInfo fetch_info(const std::string& url);
     void start_download(std::shared_ptr<DownloadItem> item,
                         ProgressCallback on_progress,
-                        StateCallback on_state);
+                        StateCallback on_state,
+                        RetryCallback on_retry = nullptr);
     void cancel_download(int id);
     void pause_download(int id);
     void resume_download(int id);

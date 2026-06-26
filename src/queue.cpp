@@ -15,6 +15,18 @@ void DownloadQueue::set_change_callback(ChangeCallback cb) {
     change_callback_ = std::move(cb);
 }
 
+bool DownloadQueue::has_url(const std::string& url) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& item : items_) {
+        if (item->url == url &&
+            (item->state == DownloadState::Pending ||
+             item->state == DownloadState::Running)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int DownloadQueue::enqueue(std::shared_ptr<DownloadItem> item) {
     ChangeCallback cb;
     {
@@ -116,91 +128,51 @@ int DownloadQueue::total_count() const {
 
 void DownloadQueue::shutdown() {
     stop_processing_ = true;
-    if (processing_thread_ && processing_thread_->joinable())
-        processing_thread_->join();
-    processing_thread_.reset();
-    processing_ = false;
 }
 
 void DownloadQueue::process() {
-    if (processing_.exchange(true)) return;
-
-    processing_thread_.emplace([this]() {
-        while (!stop_processing_) {
-            std::shared_ptr<DownloadItem> item;
-
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                int active = 0;
-                for (auto& i : items_) {
-                    if (i->state == DownloadState::Running) active++;
-                }
-
-                while (active >= max_concurrent_ && !pending_ids_.empty() && !stop_processing_) {
-                    lock.unlock();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    if (stop_processing_) { lock.lock(); break; }
-                    lock.lock();
-                    active = 0;
-                    for (auto& i : items_) {
-                        if (i->state == DownloadState::Running) active++;
-                    }
-                }
-
-                while (!pending_ids_.empty()) {
-                    int id = pending_ids_.front();
-                    pending_ids_.pop();
-                    auto it = std::find_if(items_.begin(), items_.end(),
-                        [id](const auto& i) { return i->id == id; });
-                    if (it != items_.end() && (*it)->state == DownloadState::Pending) {
-                        item = *it;
-                        break;
-                    }
-                    // BUG-09 fix: if the item was cancelled before we could start it,
-                    // it's already in a terminal state — just skip it silently.
-                    // No need to re-enqueue; it will show up in the terminal check below.
-                }
-            }
-
-            if (!item) {
-                bool all_done = true;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    for (auto& i : items_) {
-                        if (i->state == DownloadState::Pending ||
-                            i->state == DownloadState::Running) {
-                            all_done = false;
-                            break;
-                        }
-                    }
-                }
-                manager_.cleanup_finished();
-                if (all_done || stop_processing_) {
-                    processing_ = false;
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (item->state != DownloadState::Pending)
-                    continue;
-                // start_download creates a thread and returns quickly. If cancel()
-                // was called concurrently it will block on mutex_ until we release
-                // it, then set cancelled=true and kill the child process. The
-                // download thread detects cancelled via ActiveDownload::cancelled.
-                manager_.start_download(
-                    item,
-                    [this](const DownloadProgress&) { notify_change(); },
-                    [this](const DownloadItem&) { notify_change(); }
-                );
-                manager_.cleanup_finished();
+    std::vector<std::shared_ptr<DownloadItem>> to_start;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        int running = 0;
+        for (auto& i : items_) {
+            if (i->state == DownloadState::Running) running++;
+        }
+        while (!pending_ids_.empty() && running < max_concurrent_) {
+            int id = pending_ids_.front();
+            pending_ids_.pop();
+            auto it = std::find_if(items_.begin(), items_.end(),
+                [id](const auto& i) { return i->id == id; });
+            if (it != items_.end() && (*it)->state == DownloadState::Pending) {
+                to_start.push_back(*it);
+                running++;
             }
         }
-        processing_ = false;
-    });
+    }
+
+    if (to_start.empty()) {
+        manager_.cleanup_finished();
+        return;
+    }
+
+    for (auto& item : to_start) {
+        auto retry_cb = [this](int id) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_ids_.push(id);
+            // Process will be called when download finishes
+        };
+
+        manager_.start_download(
+            item,
+            [this](const DownloadProgress&) { notify_change(); },
+            [this](const DownloadItem&) {
+                notify_change();
+                process();
+            },
+            std::move(retry_cb)
+        );
+    }
+    manager_.cleanup_finished();
 }
 
 void DownloadQueue::update_title(const std::string& url, const std::string& title) {

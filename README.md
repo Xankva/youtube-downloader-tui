@@ -2,7 +2,7 @@
 
 A modern terminal user interface for downloading YouTube videos and audio, powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
-![screenshot](https://raw.githubusercontent.com/anomalyco/yt-tui/main/.github/screenshot.png)
+![screenshot](https://github.com/Xankva/youtube-downloader-tui/blob/main/Screenshot_20260626_152058-1.png)
 
 ## Features
 
